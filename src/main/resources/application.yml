@@ -1,0 +1,135 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  config:
+    # "optional:" lets the gateway start even when the Config Server is down.
+    # Override with CONFIG_SERVER_URL, e.g. inside Docker where localhost is the container.
+    import: optional:configserver:${CONFIG_SERVER_URL:http://localhost:8888}
+  cloud:
+    circuitbreaker:
+      bulkhead:
+        resilience4j:
+          # Otherwise each breaker is silently wrapped in a 25-concurrent-call bulkhead, and bursts get 503
+          # fallbacks long before the rate limiter applies. Concurrency is limited by RequestRateLimiter instead.
+          enabled: false
+    gateway:
+      # Gateway 5.x moved all properties from spring.cloud.gateway.* to spring.cloud.gateway.server.webflux.*
+      server:
+        webflux:
+          httpclient:
+            connect-timeout: 1000
+            # Backstop only: the 3s TimeLimiter below normally fires first
+            response-timeout: 4s
+          # Primary routes: clean /api/... URLs, resolved through Eureka (lb://) rather than fixed hosts
+          routes:
+            - id: user-service
+              uri: lb://user-service
+              predicates:
+                - Path=/api/users/**,/api/auth/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: userService
+                    fallbackUri: forward:/fallback/user-service
+            - id: product-service
+              uri: lb://product-service
+              predicates:
+                - Path=/api/products/**,/api/categories/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: productService
+                    fallbackUri: forward:/fallback/product-service
+            - id: order-service
+              uri: lb://order-service
+              predicates:
+                - Path=/api/orders/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: orderService
+                    fallbackUri: forward:/fallback/order-service
+          # Applied to every route, including the discovery-locator ones
+          default-filters:
+            # Built-in RequestRateLimiter backed by Gateway's Bucket4jRateLimiter with in-memory buckets
+            # (see RateLimiterConfig). 100 requests/second per route; over the limit -> 429.
+            - name: RequestRateLimiter
+              args:
+                bucket4j-rate-limiter.capacity: 100
+                bucket4j-rate-limiter.refillPeriod: 1s
+            # Downstream services may add their own CORS headers; keep the gateway's single copy
+            - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_FIRST
+          # Fallback for debugging: /USER-SERVICE/**, /PRODUCT-SERVICE/**, ... for every service registered in
+          # Eureka (prefix stripped before forwarding). Clients should use the explicit /api/... routes above.
+          discovery:
+            locator:
+              enabled: true
+          globalcors:
+            # Also answer preflight requests for paths no route matches
+            add-to-simple-url-handler-mapping: true
+            cors-configurations:
+              '[/**]':
+                # Comma-separated patterns; override with GATEWAY_CORS_ALLOWED_ORIGINS
+                allowed-origin-patterns: ${GATEWAY_CORS_ALLOWED_ORIGINS:http://localhost:*,http://127.0.0.1:*}
+                allowed-methods: GET,POST,PUT,PATCH,DELETE,OPTIONS
+                allowed-headers: "*"
+                exposed-headers: X-RateLimit-Remaining
+                allow-credentials: true
+                max-age: 3600
+
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka/}
+  instance:
+    prefer-ip-address: true
+
+# Same breaker settings as order-service's productService breaker, applied to one breaker per route.
+# Each call runs as CircuitBreaker(TimeLimiter(call)); failures and timeouts go to the route's fallbackUri.
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 2s
+        slow-call-rate-threshold: 100
+        wait-duration-in-open-state: 15s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+    instances:
+      userService:
+        base-config: default
+      productService:
+        base-config: default
+      orderService:
+        base-config: default
+  timelimiter:
+    configs:
+      default:
+        # Spring Cloud CircuitBreaker's own default is 1s; match order-service's 3s
+        timeout-duration: 3s
+        cancel-running-future: true
+    instances:
+      userService:
+        base-config: default
+      productService:
+        base-config: default
+      orderService:
+        base-config: default
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # gateway -> /actuator/gateway/routes; circuitbreakers / circuitbreakerevents show each route's breaker
+        include: health,info,gateway,circuitbreakers,circuitbreakerevents
+  endpoint:
+    gateway:
+      # Allow inspecting routes but not adding/removing them at runtime over HTTP
+      access: read-only
