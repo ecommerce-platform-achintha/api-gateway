@@ -1,7 +1,11 @@
 package com.achintha.apigateway;
 
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+
+import javax.crypto.spec.SecretKeySpec;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -16,9 +20,15 @@ import org.springframework.cloud.gateway.route.Route;
 import org.springframework.cloud.gateway.route.RouteDefinition;
 import org.springframework.cloud.gateway.route.RouteDefinitionLocator;
 import org.springframework.cloud.gateway.route.RouteLocator;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.mock.http.server.reactive.MockServerHttpRequest;
 import org.springframework.mock.web.server.MockServerWebExchange;
+import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.security.oauth2.jwt.JwsHeader;
+import org.springframework.security.oauth2.jwt.JwtClaimsSet;
+import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
+import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
 import org.springframework.test.web.reactive.server.WebTestClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -27,15 +37,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Config-level checks of the routes in application.yml. Runs without Config Server or Eureka: no service
- * instances are registered, so lb:// calls fail and exercise each route's circuit breaker fallback.
+ * instances are registered, so lb:// calls fail and exercise each route's circuit breaker fallback. The JWT secret
+ * normally comes from the Config Server, so it is set here directly.
  */
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {
                 "spring.cloud.config.enabled=false",
-                "eureka.client.enabled=false"
+                "eureka.client.enabled=false",
+                "security.jwt.secret=" + RouteConfigurationTest.JWT_SECRET
         })
 class RouteConfigurationTest {
+
+    static final String JWT_SECRET = "test-only-jwt-secret-0123456789-abcdefghij";
 
     // Route ids the discovery locator generates start with the discovery client's name
     private static final String DISCOVERY_ROUTE_PREFIX = "ReactiveCompositeDiscoveryClient_";
@@ -134,13 +148,48 @@ class RouteConfigurationTest {
             "/api/orders, order-service"
     })
     void unavailableServiceReturns503FallbackInsteadOfHanging(String path, String service) {
-        WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build()
-                .get().uri(path)
+        client().get().uri(path)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + validToken())
                 .exchange()
                 .expectStatus().isEqualTo(HttpStatus.SERVICE_UNAVAILABLE)
                 .expectHeader().exists("X-RateLimit-Remaining")
                 .expectBody()
                 .jsonPath("$.error").isEqualTo(service + " is temporarily unavailable");
+    }
+
+    @Test
+    void protectedRouteWithoutTokenIsRejectedBeforeRouting() {
+        client().get().uri("/api/orders")
+                .exchange()
+                .expectStatus().isUnauthorized()
+                .expectBody()
+                .jsonPath("$.error").isEqualTo("Authentication required");
+    }
+
+    @Test
+    void publicRouteIsRoutedWithoutToken() {
+        // Reaches the (unavailable) user-service route, so the fallback answers rather than the auth filter
+        client().post().uri("/api/auth/login")
+                .exchange()
+                .expectStatus().isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    private WebTestClient client() {
+        return WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
+    }
+
+    private static String validToken() {
+        NimbusJwtEncoder encoder = NimbusJwtEncoder.withSecretKey(
+                new SecretKeySpec(JWT_SECRET.getBytes(StandardCharsets.UTF_8), "HmacSHA256")).build();
+        JwtClaimsSet claims = JwtClaimsSet.builder()
+                .issuer("user-service")
+                .subject("3f2b8c1e-5d4a-4b6f-9e0a-1c2d3e4f5a6b")
+                .issuedAt(Instant.now())
+                .expiresAt(Instant.now().plusSeconds(900))
+                .claim("roles", List.of("ROLE_CUSTOMER"))
+                .build();
+        return encoder.encode(JwtEncoderParameters.from(JwsHeader.with(MacAlgorithm.HS256).build(), claims))
+                .getTokenValue();
     }
 
     private Map<String, RouteDefinition> explicitRouteDefinitions() {

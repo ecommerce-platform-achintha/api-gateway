@@ -133,3 +133,19 @@ management:
     gateway:
       # Allow inspecting routes but not adding/removing them at runtime over HTTP
       access: read-only
+
+api-gateway:
+  auth:
+    # Name of the property that holds the HS256 signing secret: the same key user-service reads. The Config Server
+    # supplies it (config-server/config-repo/api-gateway.yml); there is no local default, so without it the
+    # gateway refuses to start.
+    secret-property: security.jwt.secret
+    # Must match user-service's security.jwt.issuer
+    issuer: user-service
+    # Requests allowed without a token. method: omit for any method; path: Spring path pattern (/**, {id}, ...).
+    # Everything else needs "Authorization: Bearer <token>".
+    public-routes:
+      - method: POST
+        path: /api/auth/login
+      - method: POST
+        path: /api/users/register

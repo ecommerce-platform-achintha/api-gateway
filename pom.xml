@@ -48,6 +48,13 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
         <dependency>
+            <!-- JWT verification with the same Nimbus JOSE support user-service signs with (via its resource-server
+                 starter). Only the JOSE module: spring-security-config/web would switch on Spring Security's own
+                 WebFlux filter chain, and the gateway does its own auth in JwtAuthenticationFilter. -->
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-oauth2-jose</artifactId>
+        </dependency>
+        <dependency>
             <!-- In-memory (Caffeine-backed) buckets for Gateway's built-in Bucket4jRateLimiter; no Redis needed -->
             <groupId>com.bucket4j</groupId>
             <artifactId>bucket4j_jdk17-caffeine</artifactId>
