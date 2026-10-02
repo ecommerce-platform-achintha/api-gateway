@@ -1,37 +1,38 @@
 package com.achintha.apigateway.auth;
 
-import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.Optional;
 
+import com.achintha.apigateway.support.ApiErrors;
+import com.achintha.apigateway.support.RequestRule;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
-import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.MediaType;
 import org.springframework.http.server.reactive.ServerHttpRequest;
-import org.springframework.http.server.reactive.ServerHttpResponse;
-import org.springframework.security.oauth2.jwt.BadJwtException;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtException;
 import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
 import org.springframework.stereotype.Component;
-import org.springframework.util.StringUtils;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.util.pattern.PathPattern;
 import org.springframework.web.util.pattern.PathPatternParser;
 import reactor.core.publisher.Mono;
 
 /**
- * Requires a valid user-service access token on every routed request except the configured public routes, and
- * passes the caller's identity downstream as {@value #USER_ID_HEADER} / {@value #USER_ROLES_HEADER}.
- * <p>
- * Identity headers sent by the client are always removed first, on public routes too, so only the gateway can set
- * them.
+ * First line of defence for every routed request (each service validates the JWT again and enforces the real
+ * authorization rules):
+ * <ol>
+ *   <li>Removes any client-supplied {@value #USER_ID_HEADER} / {@value #USER_ROLES_HEADER}, on every request. The
+ *       gateway no longer sets them, and services must not rely on them.</li>
+ *   <li>Lets the configured public routes through without a token.</li>
+ *   <li>Otherwise requires a valid RS256 access token (see {@link JwtConfig}): 401 if missing or invalid.</li>
+ *   <li>Applies the coarse path-prefix role rules: 403 if the token's {@code role} isn't allowed there.</li>
+ * </ol>
+ * The {@code Authorization} header is forwarded unchanged. The caller's user id is stored in
+ * {@link #USER_ID_ATTR} for the rate limiter. Tokens are never logged.
  */
 @Component
 public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
@@ -39,29 +40,31 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
     public static final String USER_ID_HEADER = "X-User-Id";
     public static final String USER_ROLES_HEADER = "X-User-Roles";
 
+    /** Exchange attribute: {@code sub} of a validated token. Absent on public routes. */
+    public static final String USER_ID_ATTR = JwtAuthenticationFilter.class.getName() + ".userId";
+
     /**
-     * Before the route filters (RequestRateLimiter, CircuitBreaker: order 1 and up) and the routing filters
-     * (10000 and up). Rejected requests therefore never reach a service and don't use up a route's rate limit.
+     * Before the rate limiter, the route filters (CircuitBreaker: order 1 and up) and the routing filters (10000 and
+     * up), so rejected requests never reach a service.
      */
     public static final int ORDER = -100;
 
-    // Same claim user-service writes (SecurityConfig.ROLES_CLAIM): e.g. ["ROLE_CUSTOMER"]
-    private static final String ROLES_CLAIM = "roles";
-    private static final String BEARER_PREFIX = "Bearer ";
+    // Same message for every 401 (missing, malformed, bad signature, expired, wrong issuer/audience...), as the services
+    static final String UNAUTHORIZED_MESSAGE = "Authentication required: missing, invalid or expired token";
+    static final String FORBIDDEN_MESSAGE = "Access denied";
 
-    private static final byte[] AUTHENTICATION_REQUIRED =
-            "{\"error\":\"Authentication required\"}".getBytes(StandardCharsets.UTF_8);
-    private static final byte[] INVALID_TOKEN =
-            "{\"error\":\"Invalid or expired token\"}".getBytes(StandardCharsets.UTF_8);
+    private static final String BEARER_PREFIX = "Bearer ";
 
     private static final Logger log = LoggerFactory.getLogger(JwtAuthenticationFilter.class);
 
     private final ReactiveJwtDecoder jwtDecoder;
-    private final List<PublicRouteMatcher> publicRoutes;
+    private final List<RequestRule.Matcher> publicRoutes;
+    private final List<RoleRuleMatcher> roleRules;
 
     public JwtAuthenticationFilter(ReactiveJwtDecoder jwtDecoder, AuthProperties properties) {
         this.jwtDecoder = jwtDecoder;
-        this.publicRoutes = properties.publicRoutes().stream().map(PublicRouteMatcher::of).toList();
+        this.publicRoutes = properties.publicRoutes().stream().map(RequestRule::matcher).toList();
+        this.roleRules = properties.roleRules().stream().map(RoleRuleMatcher::of).toList();
     }
 
     @Override
@@ -77,31 +80,46 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
                     headers.remove(USER_ROLES_HEADER);
                 })
                 .build();
+        ServerWebExchange stripped = exchange.mutate().request(request).build();
 
         if (isPublic(request)) {
-            return chain.filter(exchange.mutate().request(request).build());
+            return chain.filter(stripped);
         }
 
         String token = bearerToken(request);
         if (token == null) {
-            return reject(exchange, AUTHENTICATION_REQUIRED);
+            return unauthorized(stripped);
         }
 
         return jwtDecoder.decode(token)
-                .map(JwtAuthenticationFilter::identity)
-                .map(Optional::of)
-                // Bad signature, expired, wrong issuer, unparseable, missing subject: all get the same answer
-                .onErrorResume(JwtException.class, e -> {
-                    log.debug("Rejected token for {} {}: {}", request.getMethod(), request.getPath(), e.getMessage());
-                    return Mono.just(Optional.empty());
-                })
-                .flatMap(identity -> identity
-                        .map(id -> chain.filter(exchange.mutate().request(withIdentity(request, id)).build()))
-                        .orElseGet(() -> reject(exchange, INVALID_TOKEN)));
+                .map(Outcome::valid)
+                // Nimbus reports a key-source failure as IllegalStateException, not as a JwtException
+                .onErrorResume(e -> e instanceof JwtException || causedBy(e, JwksCache.JwksUnavailableException.class),
+                        e -> Mono.just(Outcome.invalid(e)))
+                .flatMap(outcome -> {
+                    if (outcome.jwt() == null) {
+                        return rejectInvalid(stripped, outcome.error());
+                    }
+                    Jwt jwt = outcome.jwt();
+                    if (!roleAllowed(request, jwt.getClaimAsString(JwtConfig.ROLE_CLAIM))) {
+                        return ApiErrors.write(stripped, HttpStatus.FORBIDDEN, ApiErrors.ACCESS_DENIED,
+                                FORBIDDEN_MESSAGE);
+                    }
+                    stripped.getAttributes().put(USER_ID_ATTR, jwt.getSubject());
+                    return chain.filter(stripped);
+                });
     }
 
     private boolean isPublic(ServerHttpRequest request) {
         return publicRoutes.stream().anyMatch(route -> route.matches(request));
+    }
+
+    private boolean roleAllowed(ServerHttpRequest request, String role) {
+        return roleRules.stream()
+                .filter(rule -> rule.path().matches(request.getPath().pathWithinApplication()))
+                .findFirst()
+                .map(rule -> rule.roles().contains(role))
+                .orElse(true);
     }
 
     /** The token from "Authorization: Bearer &lt;token&gt;", or null if the header is missing or malformed. */
@@ -114,51 +132,48 @@ public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
         return token.isEmpty() ? null : token;
     }
 
-    private static Identity identity(Jwt jwt) {
-        String userId = jwt.getSubject();
-        if (!StringUtils.hasText(userId)) {
-            throw new BadJwtException("Token has no subject");
+    private static Mono<Void> rejectInvalid(ServerWebExchange exchange, Throwable error) {
+        // Without signing keys no token can be checked: that's the gateway's problem, not the caller's
+        if (causedBy(error, JwksCache.JwksUnavailableException.class)) {
+            log.warn("Cannot verify tokens: {}", error.toString());
+            return ApiErrors.write(exchange, HttpStatus.SERVICE_UNAVAILABLE, ApiErrors.SERVICE_UNAVAILABLE,
+                    "Authentication is temporarily unavailable");
         }
-        List<String> roles;
-        try {
-            roles = jwt.getClaimAsStringList(ROLES_CLAIM);
-        }
-        catch (RuntimeException e) {
-            throw new BadJwtException("Malformed roles claim", e);
-        }
-        return new Identity(userId, roles == null ? "" : String.join(",", roles));
+        // The reason only, never the token
+        log.debug("Rejected token for {} {}: {}", exchange.getRequest().getMethod(),
+                exchange.getRequest().getPath(), error.getMessage());
+        return unauthorized(exchange);
     }
 
-    private static ServerHttpRequest withIdentity(ServerHttpRequest request, Identity identity) {
-        return request.mutate()
-                .headers(headers -> {
-                    headers.set(USER_ID_HEADER, identity.userId());
-                    headers.set(USER_ROLES_HEADER, identity.roles());
-                })
-                .build();
+    private static Mono<Void> unauthorized(ServerWebExchange exchange) {
+        exchange.getResponse().getHeaders().set(HttpHeaders.WWW_AUTHENTICATE, "Bearer");
+        return ApiErrors.write(exchange, HttpStatus.UNAUTHORIZED, ApiErrors.UNAUTHORIZED, UNAUTHORIZED_MESSAGE);
     }
 
-    private static Mono<Void> reject(ServerWebExchange exchange, byte[] body) {
-        ServerHttpResponse response = exchange.getResponse();
-        response.setStatusCode(HttpStatus.UNAUTHORIZED);
-        response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-        response.getHeaders().set(HttpHeaders.WWW_AUTHENTICATE, "Bearer");
-        DataBuffer buffer = response.bufferFactory().wrap(body);
-        return response.writeWith(Mono.just(buffer));
+    private static boolean causedBy(Throwable error, Class<? extends Throwable> type) {
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            if (type.isInstance(t)) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    private record Identity(String userId, String roles) {
-    }
+    private record Outcome(Jwt jwt, Throwable error) {
 
-    private record PublicRouteMatcher(String method, PathPattern path) {
-
-        static PublicRouteMatcher of(AuthProperties.PublicRoute route) {
-            return new PublicRouteMatcher(route.method(), PathPatternParser.defaultInstance.parse(route.path()));
+        static Outcome valid(Jwt jwt) {
+            return new Outcome(jwt, null);
         }
 
-        boolean matches(ServerHttpRequest request) {
-            return (method == null || method.equalsIgnoreCase(request.getMethod().name()))
-                    && path.matches(request.getPath().pathWithinApplication());
+        static Outcome invalid(Throwable error) {
+            return new Outcome(null, error);
+        }
+    }
+
+    private record RoleRuleMatcher(PathPattern path, List<String> roles) {
+
+        static RoleRuleMatcher of(AuthProperties.RoleRule rule) {
+            return new RoleRuleMatcher(PathPatternParser.defaultInstance.parse(rule.path()), List.copyOf(rule.roles()));
         }
     }
 }

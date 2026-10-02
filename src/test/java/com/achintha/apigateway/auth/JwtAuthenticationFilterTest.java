@@ -1,51 +1,58 @@
 package com.achintha.apigateway.auth;
 
-import java.nio.charset.StandardCharsets;
+import java.net.URI;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
-import javax.crypto.spec.SecretKeySpec;
-
+import com.achintha.apigateway.TestTokens;
+import com.achintha.apigateway.support.RequestRule;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
-import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.http.server.reactive.MockServerHttpRequest;
 import org.springframework.mock.web.server.MockServerWebExchange;
-import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
-import org.springframework.security.oauth2.jwt.JwsHeader;
-import org.springframework.security.oauth2.jwt.JwtClaimsSet;
-import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
-import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
+import org.springframework.security.oauth2.jwt.JwtClaimNames;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
+import static com.achintha.apigateway.auth.JwtAuthenticationFilter.USER_ID_ATTR;
 import static com.achintha.apigateway.auth.JwtAuthenticationFilter.USER_ID_HEADER;
 import static com.achintha.apigateway.auth.JwtAuthenticationFilter.USER_ROLES_HEADER;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The filter with a real decoder built by {@link JwtConfig}, and tokens signed the way user-service signs them
- * (NimbusJwtEncoder, HS256, UTF-8 secret bytes, sub = user id, roles claim).
+ * The filter with the real decoder from {@link JwtConfig} (RS256, issuer, audience, 30 s skew), keys served from
+ * memory instead of user-service's JWKS endpoint.
  */
 class JwtAuthenticationFilterTest {
 
-    private static final String SECRET = "test-only-jwt-secret-0123456789-abcdefghij";
-    private static final String ISSUER = "user-service";
-    private static final String USER_ID = "3f2b8c1e-5d4a-4b6f-9e0a-1c2d3e4f5a6b";
-
-    private final AuthProperties properties = new AuthProperties("security.jwt.secret", ISSUER, List.of(
-            new AuthProperties.PublicRoute("POST", "/api/auth/login"),
-            new AuthProperties.PublicRoute("POST", "/api/users/register")));
+    static final AuthProperties PROPERTIES = new AuthProperties(
+            URI.create("http://user-service.test/.well-known/jwks.json"),
+            TestTokens.ISSUER, TestTokens.AUDIENCE, 30, Duration.ofMinutes(5), Duration.ofSeconds(10),
+            List.of(
+                    new RequestRule("POST", "/api/auth/login"),
+                    new RequestRule("POST", "/api/auth/refresh"),
+                    new RequestRule("POST", "/api/users/register/customer"),
+                    new RequestRule("POST", "/api/users/register/merchant"),
+                    new RequestRule("GET", "/.well-known/jwks.json"),
+                    new RequestRule("GET", "/api/public/**")),
+            List.of(
+                    new AuthProperties.RoleRule("/api/customer/**", List.of("ROLE_CUSTOMER")),
+                    new AuthProperties.RoleRule("/api/merchant/owner/**", List.of("ROLE_MERCHANT")),
+                    new AuthProperties.RoleRule("/api/merchant/**", List.of("ROLE_MERCHANT", "ROLE_ASSISTANT")),
+                    new AuthProperties.RoleRule("/api/admin/**", List.of("ROLE_ADMIN", "ROLE_SUPER_ADMIN")),
+                    new AuthProperties.RoleRule("/api/super-admin/**", List.of("ROLE_SUPER_ADMIN"))));
 
     private final JwtAuthenticationFilter filter = new JwtAuthenticationFilter(
-            new JwtConfig().jwtDecoder(new MockEnvironment().withProperty("security.jwt.secret", SECRET), properties),
-            properties);
+            JwtConfig.jwtDecoder(PROPERTIES, () -> Mono.just(TestTokens.jwks()), Clock.systemUTC()), PROPERTIES);
 
     /** The exchange the filter passed on, or null if it stopped the request. */
     private final AtomicReference<ServerWebExchange> forwarded = new AtomicReference<>();
@@ -55,115 +62,211 @@ class JwtAuthenticationFilterTest {
     };
 
     @Test
-    void validTokenPassesThroughWithIdentityHeaders() {
-        MockServerWebExchange exchange = run(MockServerHttpRequest.get("/api/orders")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token(SECRET, ISSUER, Instant.now().plusSeconds(900),
-                        List.of("ROLE_ADMIN", "ROLE_CUSTOMER"))));
+    void validRs256TokenPassesWithAuthorizationUnchangedAndNoIdentityHeaders() {
+        String token = TestTokens.valid("ROLE_CUSTOMER");
+
+        MockServerWebExchange exchange = run(MockServerHttpRequest.get("/api/customer/orders")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token));
 
         assertThat(exchange.getResponse().getStatusCode()).isNull();
         HttpHeaders headers = forwarded.get().getRequest().getHeaders();
-        assertThat(headers.get(USER_ID_HEADER)).containsExactly(USER_ID);
-        assertThat(headers.get(USER_ROLES_HEADER)).containsExactly("ROLE_ADMIN,ROLE_CUSTOMER");
+        assertThat(headers.get(HttpHeaders.AUTHORIZATION)).containsExactly("Bearer " + token);
+        assertThat(headers.containsHeader(USER_ID_HEADER)).isFalse();
+        assertThat(headers.containsHeader(USER_ROLES_HEADER)).isFalse();
+        assertThat(forwarded.get().<String>getAttribute(USER_ID_ATTR)).isEqualTo(TestTokens.USER_ID);
     }
 
     @Test
-    void identityHeadersFromClientAreReplacedNotForwarded() {
+    void spoofedIdentityHeadersAreStrippedOnProtectedRoutes() {
         run(MockServerHttpRequest.get("/api/users/me")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token(SECRET, ISSUER, Instant.now().plusSeconds(900),
-                        List.of("ROLE_CUSTOMER")))
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + TestTokens.valid("ROLE_CUSTOMER"))
                 .header(USER_ID_HEADER, "someone-else")
-                .header("x-user-roles", "ROLE_ADMIN"));
+                .header("x-user-roles", "ROLE_SUPER_ADMIN"));
 
         HttpHeaders headers = forwarded.get().getRequest().getHeaders();
-        assertThat(headers.get(USER_ID_HEADER)).containsExactly(USER_ID);
-        assertThat(headers.get(USER_ROLES_HEADER)).containsExactly("ROLE_CUSTOMER");
+        assertThat(headers.containsHeader(USER_ID_HEADER)).isFalse();
+        assertThat(headers.containsHeader(USER_ROLES_HEADER)).isFalse();
     }
 
     @Test
-    void tokenWithoutRolesClaimForwardsEmptyRoles() {
-        run(MockServerHttpRequest.get("/api/orders")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token(SECRET, ISSUER, Instant.now().plusSeconds(900),
-                        null)));
+    void spoofedIdentityHeadersAreStrippedOnPublicRoutes() {
+        run(MockServerHttpRequest.post("/api/auth/login")
+                .header(USER_ID_HEADER, "someone-else")
+                .header(USER_ROLES_HEADER, "ROLE_SUPER_ADMIN"));
 
-        assertThat(forwarded.get().getRequest().getHeaders().get(USER_ROLES_HEADER)).containsExactly("");
+        HttpHeaders headers = forwarded.get().getRequest().getHeaders();
+        assertThat(headers.containsHeader(USER_ID_HEADER)).isFalse();
+        assertThat(headers.containsHeader(USER_ROLES_HEADER)).isFalse();
+        assertThat(forwarded.get().<String>getAttribute(USER_ID_ATTR)).isNull();
     }
 
     @Test
-    void missingTokenOnProtectedRouteIsRejected() {
-        MockServerWebExchange exchange = run(MockServerHttpRequest.get("/api/orders"));
-
-        assertRejected(exchange, "{\"error\":\"Authentication required\"}");
+    void missingAuthorizationHeaderIsRejected() {
+        assertUnauthorized(run(MockServerHttpRequest.get("/api/users/me")));
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"Basic dXNlcjpwYXNz", "Bearer", "Bearer   ", "Token abc.def.ghi"})
+    @ValueSource(strings = {"Basic dXNlcjpwYXNz", "Bearer", "Bearer   ", "Token abc.def.ghi", "Bearer not-a-jwt"})
     void malformedAuthorizationHeaderIsRejected(String header) {
-        MockServerWebExchange exchange = run(MockServerHttpRequest.get("/api/orders")
-                .header(HttpHeaders.AUTHORIZATION, header));
-
-        assertRejected(exchange, "{\"error\":\"Authentication required\"}");
+        assertUnauthorized(run(MockServerHttpRequest.get("/api/users/me").header(HttpHeaders.AUTHORIZATION, header)));
     }
 
     @Test
-    void expiredTokenIsRejected() {
-        // Past the decoder's 60 s clock-skew allowance
-        String expired = token(SECRET, ISSUER, Instant.now().minus(Duration.ofMinutes(5)), List.of("ROLE_CUSTOMER"));
-
-        MockServerWebExchange exchange = run(MockServerHttpRequest.get("/api/orders")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + expired));
-
-        assertRejected(exchange, "{\"error\":\"Invalid or expired token\"}");
+    void tokenSignedWithAnotherKeyIsRejected() {
+        assertRejectedToken(TestTokens.signedWithOtherKey());
     }
 
     @Test
-    void tokenSignedWithAnotherSecretIsRejected() {
-        String forged = token("some-other-secret-that-is-long-enough-0123456789", ISSUER,
-                Instant.now().plusSeconds(900), List.of("ROLE_ADMIN"));
-
-        MockServerWebExchange exchange = run(MockServerHttpRequest.get("/api/orders")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + forged));
-
-        assertRejected(exchange, "{\"error\":\"Invalid or expired token\"}");
+    void tokenWithUnknownKeyIdIsRejected() {
+        assertRejectedToken(TestTokens.signedWithUnknownKid());
     }
 
     @Test
-    void tokenFromAnotherIssuerIsRejected() {
-        String other = token(SECRET, "someone-else", Instant.now().plusSeconds(900), List.of("ROLE_CUSTOMER"));
-
-        MockServerWebExchange exchange = run(MockServerHttpRequest.get("/api/orders")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + other));
-
-        assertRejected(exchange, "{\"error\":\"Invalid or expired token\"}");
+    void algNoneTokenIsRejected() {
+        assertRejectedToken(TestTokens.algNone());
     }
 
     @Test
-    void unparseableTokenIsRejected() {
-        MockServerWebExchange exchange = run(MockServerHttpRequest.get("/api/orders")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer not-a-jwt"));
-
-        assertRejected(exchange, "{\"error\":\"Invalid or expired token\"}");
+    void hs256TokenIsRejectedEvenWhenSignedWithThePublicKey() {
+        assertRejectedToken(TestTokens.hs256WithPublicKey());
     }
 
     @Test
-    void publicRoutesPassWithoutTokenAndWithoutClientIdentityHeaders() {
-        for (String path : List.of("/api/auth/login", "/api/users/register")) {
-            forwarded.set(null);
-            MockServerWebExchange exchange = run(MockServerHttpRequest.post(path)
-                    .header(USER_ID_HEADER, "someone-else")
-                    .header(USER_ROLES_HEADER, "ROLE_ADMIN"));
-
-            assertThat(exchange.getResponse().getStatusCode()).as(path).isNull();
-            HttpHeaders headers = forwarded.get().getRequest().getHeaders();
-            assertThat(headers.containsHeader(USER_ID_HEADER)).as(path).isFalse();
-            assertThat(headers.containsHeader(USER_ROLES_HEADER)).as(path).isFalse();
-        }
+    void wrongIssuerIsRejected() {
+        assertRejectedToken(TestTokens.rs256(claims -> claims.issuer("someone-else").claim("role", "ROLE_ADMIN")));
     }
 
     @Test
-    void publicPathWithOtherMethodStillNeedsToken() {
-        MockServerWebExchange exchange = run(MockServerHttpRequest.get("/api/auth/login"));
+    void wrongAudienceIsRejected() {
+        assertRejectedToken(TestTokens.rs256(claims -> claims.audience(List.of("other-app")).claim("role", "ROLE_ADMIN")));
+    }
 
-        assertRejected(exchange, "{\"error\":\"Authentication required\"}");
+    @Test
+    void missingAudienceIsRejected() {
+        assertRejectedToken(TestTokens.rs256(claims -> claims.claims(c -> c.remove(JwtClaimNames.AUD))
+                .claim("role", "ROLE_ADMIN")));
+    }
+
+    @Test
+    void expiredTokenBeyondClockSkewIsRejected() {
+        Instant expired = Instant.now().minusSeconds(31 + 5);
+        assertRejectedToken(TestTokens.rs256(claims -> claims.issuedAt(expired.minusSeconds(600)).expiresAt(expired)
+                .claim("role", "ROLE_CUSTOMER")));
+    }
+
+    @Test
+    void tokenExpiredWithinClockSkewIsAccepted() {
+        Instant expired = Instant.now().minusSeconds(10);
+        String token = TestTokens.rs256(claims -> claims.issuedAt(expired.minusSeconds(600)).expiresAt(expired)
+                .claim("role", "ROLE_CUSTOMER"));
+
+        run(MockServerHttpRequest.get("/api/users/me").header(HttpHeaders.AUTHORIZATION, "Bearer " + token));
+
+        assertThat(forwarded.get()).isNotNull();
+    }
+
+    @Test
+    void notYetValidTokenIsRejected() {
+        Instant later = Instant.now().plusSeconds(120);
+        assertRejectedToken(TestTokens.rs256(claims -> claims.notBefore(later).claim("role", "ROLE_CUSTOMER")));
+    }
+
+    @Test
+    void tokenWithoutExpiryIsRejected() {
+        assertRejectedToken(TestTokens.rs256(claims -> claims.claims(c -> c.remove(JwtClaimNames.EXP))
+                .claim("role", "ROLE_CUSTOMER")));
+    }
+
+    @Test
+    void tokenWithoutRoleIsRejected() {
+        assertRejectedToken(TestTokens.rs256(claims -> { }));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "POST, /api/auth/login",
+            "POST, /api/auth/refresh",
+            "POST, /api/users/register/customer",
+            "POST, /api/users/register/merchant",
+            "GET, /.well-known/jwks.json",
+            "GET, /api/public/products",
+            "GET, /api/public/stores/STR-2610-7K2M9Q/reviews"
+    })
+    void publicRoutesPassWithoutToken(String method, String path) {
+        MockServerWebExchange exchange = run(MockServerHttpRequest.method(HttpMethod.valueOf(method), path));
+
+        assertThat(exchange.getResponse().getStatusCode()).isNull();
+        assertThat(forwarded.get()).isNotNull();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "GET, /api/auth/login",
+            "POST, /api/auth/logout",
+            "POST, /api/public/products",
+            "DELETE, /api/public/stores/STR-2610-7K2M9Q",
+            "POST, /api/users/register/admin",
+            "POST, /.well-known/jwks.json"
+    })
+    void otherMethodsOnPublicPathsNeedToken(String method, String path) {
+        assertUnauthorized(run(MockServerHttpRequest.method(HttpMethod.valueOf(method), path)));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "ROLE_CUSTOMER,    /api/customer/cart",
+            "ROLE_MERCHANT,    /api/merchant/orders",
+            "ROLE_ASSISTANT,   /api/merchant/orders/ORD-2610-7K2M9Q/ship",
+            "ROLE_MERCHANT,    /api/merchant/owner/assistants",
+            "ROLE_ADMIN,       /api/admin/orders",
+            "ROLE_SUPER_ADMIN, /api/admin/merchants/pending",
+            "ROLE_SUPER_ADMIN, /api/super-admin/admins",
+            "ROLE_CUSTOMER,    /api/users/me",
+            "ROLE_ASSISTANT,   /api/users/me"
+    })
+    void allowedRolesPassThePrefixCheck(String role, String path) {
+        MockServerWebExchange exchange = run(MockServerHttpRequest.get(path)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + TestTokens.valid(role)));
+
+        assertThat(exchange.getResponse().getStatusCode()).isNull();
+        assertThat(forwarded.get()).isNotNull();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "ROLE_MERCHANT,    /api/customer/cart",
+            "ROLE_ADMIN,       /api/customer/checkout",
+            "ROLE_CUSTOMER,    /api/merchant/orders",
+            "ROLE_ASSISTANT,   /api/merchant/owner/assistants",
+            "ROLE_ASSISTANT,   /api/merchant/owner/bank-accounts",
+            "ROLE_CUSTOMER,    /api/admin/orders",
+            "ROLE_MERCHANT,    /api/admin/merchants/pending",
+            "ROLE_ADMIN,       /api/super-admin/admins",
+            "ROLE_SERVICE,     /api/admin/users"
+    })
+    void wrongRoleGets403WithStandardBody(String role, String path) {
+        MockServerWebExchange exchange = run(MockServerHttpRequest.get(path)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + TestTokens.valid(role)));
+
+        assertThat(forwarded.get()).isNull();
+        assertThat(exchange.getResponse().getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+        assertThat(exchange.getResponse().getBodyAsString().block())
+                .contains("\"status\":403", "\"error\":\"Forbidden\"", "\"code\":\"ACCESS_DENIED\"",
+                        "\"message\":\"Access denied\"", "\"path\":\"" + path + "\"");
+    }
+
+    @Test
+    void unreachableJwksGives503NotA401() {
+        JwtAuthenticationFilter noKeys = new JwtAuthenticationFilter(JwtConfig.jwtDecoder(PROPERTIES,
+                () -> Mono.error(new IllegalStateException("connection refused")), Clock.systemUTC()), PROPERTIES);
+        MockServerWebExchange exchange = MockServerWebExchange.from(MockServerHttpRequest.get("/api/users/me")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + TestTokens.valid("ROLE_CUSTOMER")));
+
+        noKeys.filter(exchange, chain).block();
+
+        assertThat(forwarded.get()).isNull();
+        assertThat(exchange.getResponse().getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(exchange.getResponse().getBodyAsString().block()).contains("\"code\":\"SERVICE_UNAVAILABLE\"");
     }
 
     private MockServerWebExchange run(MockServerHttpRequest.BaseBuilder<?> request) {
@@ -172,27 +275,18 @@ class JwtAuthenticationFilterTest {
         return exchange;
     }
 
-    private void assertRejected(MockServerWebExchange exchange, String body) {
+    private void assertRejectedToken(String token) {
+        assertUnauthorized(run(MockServerHttpRequest.get("/api/users/me")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)));
+    }
+
+    private void assertUnauthorized(MockServerWebExchange exchange) {
         assertThat(forwarded.get()).isNull();
         assertThat(exchange.getResponse().getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
         assertThat(exchange.getResponse().getHeaders().getFirst(HttpHeaders.WWW_AUTHENTICATE)).isEqualTo("Bearer");
-        assertThat(exchange.getResponse().getBodyAsString().block()).isEqualTo(body);
-    }
-
-    /** Signed like user-service's JwtService; {@code roles} null leaves the claim out. */
-    private static String token(String secret, String issuer, Instant expiresAt, List<String> roles) {
-        NimbusJwtEncoder encoder = NimbusJwtEncoder.withSecretKey(
-                new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256")).build();
-        JwtClaimsSet.Builder claims = JwtClaimsSet.builder()
-                .issuer(issuer)
-                .subject(USER_ID)
-                .issuedAt(expiresAt.minus(Duration.ofMinutes(15)))
-                .expiresAt(expiresAt)
-                .claim("email", "jane@example.com");
-        if (roles != null) {
-            claims.claim("roles", roles);
-        }
-        return encoder.encode(JwtEncoderParameters.from(JwsHeader.with(MacAlgorithm.HS256).build(), claims.build()))
-                .getTokenValue();
+        // One body for every reason, in the platform's standard error shape
+        assertThat(exchange.getResponse().getBodyAsString().block())
+                .contains("\"status\":401", "\"error\":\"Unauthorized\"", "\"code\":\"UNAUTHORIZED\"",
+                        "\"message\":\"" + JwtAuthenticationFilter.UNAUTHORIZED_MESSAGE + "\"");
     }
 }

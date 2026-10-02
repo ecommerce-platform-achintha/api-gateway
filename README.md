@@ -1,100 +1,169 @@
 # api-gateway
 
-Single entry point for the platform. It routes `/api/...` requests to **user-service**, **product-service** and
-**order-service**, which it finds through Eureka. It is a reactive Spring Cloud Gateway (WebFlux on Netty), not a
-servlet app.
+Single entry point for the marketplace. It routes `/api/...` requests to **user-service**, **store-service**,
+**product-service** and **order-service**, which it finds through Eureka. It is a reactive Spring Cloud Gateway
+(WebFlux on Netty), not a servlet app.
+
+The gateway is the **first line of defence only**. Every service validates the JWT again and enforces the real
+authorization rules (see `docs/marketplace-design.md`, sections 3 and 11). The gateway holds no business logic.
 
 - Java 25, Spring Boot 4.1.1, Spring Cloud 2025.1.3 (Gateway 5.0), Maven
-- Routes in `application.yml`, resolved through Eureka (`lb://<service-id>`, no hardcoded hosts)
-- JWT authentication: verifies user-service's access tokens and passes `X-User-Id` / `X-User-Roles` downstream
+- RS256 JWT check against user-service's JWKS (cached), with issuer, audience and expiry checks
+- Public-route list and coarse path-prefix role checks, both from config
+- `/internal/**` is never reachable through the gateway
+- Per-client rate limits (user id, else client IP) in tiers, with `429` and `Retry-After`
+- CORS from an explicit origin list, security headers, and a request body size limit
 - Resilience4j circuit breaker per route, with a JSON 503 fallback
-- In-memory rate limiting (100 requests/second per route) with Gateway's built-in `RequestRateLimiter`
-- Global CORS for local frontend development
-- Config from the Config Server (`optional:configserver:http://localhost:8888`), including the JWT secret
+- Config from the Config Server (`optional:configserver:http://localhost:8888`)
 - Port **8080**
 
 > **Dependency names in Spring Cloud 2025.1.** Gateway 5.0 no longer ships `spring-cloud-starter-gateway`. The
 > reactive gateway is now `spring-cloud-starter-gateway-server-webflux`, and its properties moved from
 > `spring.cloud.gateway.*` to `spring.cloud.gateway.server.webflux.*`. The circuit breaker starter is
-> `spring-cloud-starter-circuitbreaker-reactor-resilience4j`, because the plain `-resilience4j` starter has no
-> reactive circuit breaker and the gateway's `CircuitBreaker` filter can't work without one. Don't add
-> `spring-boot-starter-web`: a servlet stack conflicts with the gateway.
+> `spring-cloud-starter-circuitbreaker-reactor-resilience4j`. Don't add `spring-boot-starter-web`: a servlet stack
+> conflicts with the gateway.
+
+## Request pipeline
+
+Every request passes these steps in order. The first one that rejects the request answers it.
+
+| # | Step | Applies to | Rejects with |
+|---|---|---|---|
+| 1 | `SecurityHeadersFilter` | every response | – (adds headers) |
+| 2 | `CorsWebFilter` | every request; answers preflights itself | 403 for an unlisted origin, method or header |
+| 3 | `RequestGuardFilter` | every request | 400 `.`/`..`/encoded-slash path segments, 404 `/internal/**` and `/fallback/**`, 413 body too large, 411 chunked body |
+| 4 | Route matching | | 404 if no route matches |
+| 5 | `JwtAuthenticationFilter` | routed requests | 401 missing/invalid token, 403 wrong role for the path prefix, 503 if signing keys can't be fetched |
+| 6 | `RateLimitFilter` | routed requests | 429 + `Retry-After` |
+| 7 | `CircuitBreaker` (per route) | routed requests | 503 fallback if the service is down or slow |
+| 8 | `DownstreamPathGuardFilter` | the final downstream URL | 404 if a rewrite would reach `/internal/**` |
+
+All gateway errors use the platform's standard error body:
+
+```json
+{"timestamp":"2026-10-01T08:00:00Z","status":401,"error":"Unauthorized","code":"UNAUTHORIZED",
+ "message":"Authentication required: missing, invalid or expired token","path":"/api/customer/orders"}
+```
+
+| Status | `code` |
+|---|---|
+| 400 | `BAD_REQUEST` |
+| 401 | `UNAUTHORIZED`, with `WWW-Authenticate: Bearer` |
+| 403 | `ACCESS_DENIED` |
+| 404 | `NOT_FOUND` |
+| 411 / 413 | `LENGTH_REQUIRED` / `PAYLOAD_TOO_LARGE` |
+| 429 | `RATE_LIMITED`, with `Retry-After` |
+| 503 | `SERVICE_UNAVAILABLE` |
+
+## Authentication model
+
+user-service signs access tokens with **RS256**, and its private key never leaves it. The public keys are published
+at `GET /.well-known/jwks.json`. The gateway, like every service, verifies tokens against that JWKS. There is **no
+shared secret** any more.
+
+`JwtConfig` builds a `NimbusReactiveJwtDecoder` that checks:
+
+- the signature, with **RS256 only**. This rejects `alg=none` and HS256 tokens, including HS256 tokens "signed"
+  with the public key (the algorithm-confusion attack)
+- `iss` = `security.jwt.issuer` (`user-service`)
+- `aud` contains `security.jwt.audience` (`marketplace`)
+- `exp` must be present; `exp`/`nbf` are checked with **30 s** clock skew
+- `sub` and `role` must not be blank
+
+Keys are cached by `JwksCache`:
+
+- The key set is fetched on first use and re-fetched on the next request after **5 min**.
+- A token whose `kid` isn't cached (key rotation) triggers an immediate re-fetch, at most once every **10 s**. This
+  stops tokens with made-up key ids from flooding user-service with JWKS requests.
+- If a re-fetch fails, the cached keys are still used.
+- If no keys were ever fetched (user-service down at first use), protected routes answer **503**, not 401.
+
+Every 401 has the same body, whatever the reason (missing, malformed, bad signature, expired, wrong
+issuer/audience). Rejections are logged at DEBUG with the reason only. **Tokens are never logged.**
+
+The gateway doesn't check the token version (`tv`) against revocations. Each service does that with its
+`user_security_state` cache. Access tokens live 10 minutes.
+
+### Identity headers
+
+The gateway **no longer injects `X-User-Id` / `X-User-Roles`.** It forwards the `Authorization` header unchanged,
+and each service derives the identity from the JWT itself. Any `X-User-Id` / `X-User-Roles` sent by a client is
+**removed from every request**, public ones included, so a service that still read them couldn't be fooled.
+
+### Public routes
+
+These requests need no token (`api-gateway.auth.public-routes`). Only the listed method is public:
+`GET /api/auth/login` or `POST /api/public/...` still need a token.
+
+| Method | Path |
+|---|---|
+| POST | `/api/auth/login` |
+| POST | `/api/auth/refresh` |
+| POST | `/api/users/register/customer` |
+| POST | `/api/users/register/merchant` |
+| GET | `/.well-known/jwks.json` |
+| GET | `/api/public/**` |
+
+Everything else needs `Authorization: Bearer <access token>`.
+
+### Path-prefix role checks
+
+These are coarse checks (`api-gateway.auth.role-rules`) on the token's `role` claim. They're defence in depth: the
+services still enforce every rule, including assistant permissions and ownership. The first matching rule decides.
+Paths that match no rule (e.g. `/api/users/me`, `/api/auth/logout`) only need a valid token. A wrong role gets
+**403** `ACCESS_DENIED`.
+
+| Path | Allowed roles |
+|---|---|
+| `/api/customer/**` | `ROLE_CUSTOMER` |
+| `/api/merchant/owner/**` | `ROLE_MERCHANT` (owner-only, design 3.4) |
+| `/api/merchant/**` | `ROLE_MERCHANT`, `ROLE_ASSISTANT` |
+| `/api/admin/**` | `ROLE_ADMIN`, `ROLE_SUPER_ADMIN` |
+| `/api/super-admin/**` | `ROLE_SUPER_ADMIN` |
 
 ## Routes
 
-| Path | Routed to | Circuit breaker | Fallback |
-|---|---|---|---|
-| `/api/users/**`, `/api/auth/**` | `lb://user-service` | `userService` | `503 {"error": "user-service is temporarily unavailable"}` |
-| `/api/products/**`, `/api/categories/**` | `lb://product-service` | `productService` | `503 {"error": "product-service is temporarily unavailable"}` |
-| `/api/orders/**` | `lb://order-service` | `orderService` | `503 {"error": "order-service is temporarily unavailable"}` |
-| `/<SERVICE-ID>/**` (e.g. `/USER-SERVICE/api/users/me`) | that service, prefix stripped | none | none |
+Each service has one route with its own circuit breaker and fallback. Paths are forwarded unchanged. The route
+patterns **never overlap**, so a request matches at most one route. `RouteConfigurationTest` checks this with a
+sample path for each endpoint group. Each route also has a fixed `order` (10/20/30/40).
 
-Paths are forwarded unchanged: `/api/orders/1` reaches order-service as `/api/orders/1`.
-
-The last row comes from the **discovery locator**. It creates a route for every service registered in Eureka and
-serves as a fallback for debugging. Clients should use the `/api/...` routes, which have cleaner URLs and a
-circuit breaker.
-
-## Authentication
-
-`JwtAuthenticationFilter` is a global filter that runs before the rate limiter, the circuit breaker and routing.
-Every request to a routed path needs a valid access token from user-service, except the public routes:
-
-| Access | Method | Path |
+| Route → service | Paths | Breaker |
 |---|---|---|
-| **public** | POST | `/api/auth/login` |
-| **public** | POST | `/api/users/register` |
-| protected (`Authorization: Bearer <token>`) | any | everything else: `/api/users/**`, `/api/products/**`, `/api/categories/**`, `/api/orders/**`, the `/<SERVICE-ID>/**` debug routes |
+| **user-service** | `/api/auth/**`, `/api/users/**`, `/api/merchant/application/**`, `/api/merchant/owner/assistants/**`, `/api/admin/users/**`, `/api/admin/merchants/pending`, `/api/admin/merchants/*/{approve,reject,ban,unban}`, `/api/admin/customers/*/{ban,unban}`, `/api/super-admin/admins/**`, `/.well-known/jwks.json` | `userService` |
+| **store-service** | `/api/public/stores/**`, `/api/merchant/store/**`, `/api/merchant/owner/{bank-accounts,couriers,shipping-templates,metrics}/**`, `/api/merchant/reviews/**`, `/api/customer/stores/**`, `/api/admin/stores/**`, `/api/admin/merchants/at-risk`, `/api/admin/banks/**`, `/api/admin/couriers/**`, `/api/super-admin/{settings,holidays,merchants}/**` | `storeService` |
+| **product-service** | `/api/public/products/**`, `/api/public/categories/**`, `/api/merchant/products/**`, `/api/merchant/variants/**`, `/api/merchant/discounts/**`, `/api/customer/products/**`, `/api/admin/products/**`, `/api/admin/categories/**`, `/api/admin/reviews/**` | `productService` |
+| **order-service** | `/api/customer/cart/**`, `/api/customer/checkout`, `/api/customer/orders/**`, `/api/customer/complaints/**`, `/api/merchant/orders/**` (incl. `/complaints`), `/api/merchant/customer-blocks/**`, `/api/admin/orders/**`, `/api/admin/complaints/**`, `/api/admin/flagged-references/**`, `/api/admin/customers/*/score` | `orderService` |
 
-Only the listed method is public: e.g. `GET /api/auth/login` still needs a token. The list lives in
-`application.yml` (`api-gateway.auth.public-routes`, Spring path patterns such as `/api/public/**`). An entry
-without `method` allows any method. `/actuator/**` and CORS preflight (`OPTIONS`) requests aren't routed, so the
-filter doesn't apply to them.
+Overlaps were resolved by using the exact paths the services implement:
 
-The gateway verifies tokens exactly as user-service does:
+- `/api/admin/customers/*/score` → order-service, and `/api/admin/customers/*/ban|unban` → user-service, rather than
+  a broad `/api/admin/customers/**`.
+- `/api/admin/merchants/at-risk` → store-service, and `/api/admin/merchants/pending` and `/*/approve|reject|ban|unban`
+  → user-service.
+- `/api/merchant/products/reviews/**` stays inside product-service's `/api/merchant/products/**`, while store reviews
+  are under `/api/merchant/reviews/**` (store-service).
 
-- HS256 signature, using the UTF-8 bytes of the shared secret
-- `exp`/`nbf` checks with 60 s clock skew
-- `iss` must be `user-service` (`api-gateway.auth.issuer`)
+### `/internal/**` is never reachable
 
-The implementation is the same too: Spring Security's Nimbus JOSE support (`spring-security-oauth2-jose`). The
-gateway uses only that module, not Spring Security's web filter chain.
+- No route matches `/internal/**`.
+- `RequestGuardFilter` answers `/internal/**` with 404 before routing. It compares decoded segments, ignoring case,
+  `;matrix` parameters and empty `//` segments.
+- Paths with `.`/`..` or encoded `/`/`\` segments get 400, because a servlet container would normalise
+  `/api/public/../../internal/x` into `/internal/x`.
+- `DownstreamPathGuardFilter` checks the final downstream URL after every rewrite. This covers the discovery
+  locator's `/USER-SERVICE/internal/...`.
 
-| Request | Response |
-|---|---|
-| No `Authorization` header, or not `Bearer <token>` | **401** `{"error": "Authentication required"}` |
-| Bad signature, expired, wrong issuer, unparseable, no `sub` | **401** `{"error": "Invalid or expired token"}` (the same body in every case, so the reason isn't revealed) |
-| Valid token | Forwarded with `X-User-Id: <sub>` and `X-User-Roles: <roles claim, comma-separated>` (e.g. `ROLE_CUSTOMER`) |
+### Discovery-locator debug routes
 
-401 responses also carry `WWW-Authenticate: Bearer` and the usual CORS headers.
-
-Clients can't forge an identity. The gateway removes any incoming `X-User-Id` / `X-User-Roles` headers from every
-request, public ones included, before it sets its own. The services can therefore trust these headers, as long as
-they are only reachable through the gateway.
-
-### Where the secret comes from
-
-The gateway reads the secret from `security.jwt.secret`, the same key user-service reads. The key name is set in
-`api-gateway.auth.secret-property`. The Config Server supplies the value from
-`config-server/config-repo/api-gateway.yml`:
-
-```yaml
-security:
-  jwt:
-    secret: ${JWT_SECRET:local-dev-only-jwt-secret-change-me-0123456789}
-```
-
-This line must stay **identical** to the one in `config-repo/user-service.yml`, fallback included. The Config
-Server only serves `user-service.yml` to user-service, so the gateway needs its own copy. The placeholder is
-resolved by each service, so outside local development set the **same `JWT_SECRET`** in both services'
-environments.
-
-There is no local default. If the gateway can't get the secret (Config Server down, key missing, or fewer than
-32 bytes), it **fails at startup** rather than accepting or rejecting everything.
+`/<SERVICE-ID>/**` routes, one per service in Eureka, are enabled **only in the `local` profile**
+(`application-local.yml`), along with the `gateway` actuator endpoint. They need a token, have no circuit breaker,
+and can't reach `/internal/**`. They see the prefixed path, so the role-prefix rules don't apply to them (the
+services' own rules still do).
 
 ### Circuit breakers
 
-Each route has its own breaker, with the same settings as order-service's `productService` breaker:
+There is one breaker per route (`userService`, `storeService`, `productService`, `orderService`), all with the same
+settings:
 
 | Setting | Value |
 |---|---|
@@ -104,78 +173,139 @@ Each route has its own breaker, with the same settings as order-service's `produ
 | open-state wait → half-open trial calls | 15 s → 3 |
 | time limit per call | 3 s (Netty response timeout 4 s as a backstop, connect timeout 1 s) |
 
-These cases trigger the fallback:
+The fallback answers **503** `{"code":"SERVICE_UNAVAILABLE","message":"<service> is temporarily unavailable",...}`
+when:
 
 - the service has no instance in Eureka
-- the connection is refused (the service is stopped but Eureka still lists it)
-- the call takes longer than 3 s
+- the connection is refused
+- the call exceeds 3 s
 - the breaker is open
 
-A response from the service itself, including a 4xx or 5xx, passes through unchanged and doesn't count as a
-failure.
+A response from the service itself, including a 4xx/5xx, passes through unchanged. The Resilience4j bulkhead is
+off (`spring.cloud.circuitbreaker.bulkhead.resilience4j.enabled: false`), so bursts are limited by the rate limiter,
+not by 25-call bulkheads.
 
-Spring Cloud CircuitBreaker normally wraps every breaker in a bulkhead that allows 25 concurrent calls. This
-gateway turns that off (`spring.cloud.circuitbreaker.bulkhead.resilience4j.enabled: false`). Otherwise a burst of
-parallel requests gets 503 fallbacks from a healthy service before the rate limiter applies.
+## Rate limiting
 
-### Rate limiting
+`RateLimitFilter` limits **per client, not per route**. It runs after authentication.
 
-`RequestRateLimiter` is a default filter, so it applies to every route, including discovery-locator routes. It
-uses Gateway's `Bucket4jRateLimiter` with buckets in a local Caffeine cache (`RateLimiterConfig`), not Redis.
+- **Key**: for `user-or-ip` tiers, the authenticated user id (`sub`), otherwise the client IP. `ip` tiers always
+  use the IP.
+- **Client IP**: the TCP peer address. `X-Forwarded-For` is used only when the peer is in
+  `api-gateway.rate-limit.trusted-proxies` (IPs or CIDRs, env `GATEWAY_TRUSTED_PROXIES`). The client is then the
+  right-most address that isn't itself a trusted proxy. Otherwise a client could pick a fresh IP for every
+  request.
+- **Tiers** (`api-gateway.rate-limit.tiers`): the first tier with a matching route applies, else `default`.
 
-- There is one bucket per route, shared by all clients: 100 tokens, refilled to 100 every second.
-- Each response carries `X-RateLimit-Remaining`. Over the limit, the gateway returns **429 Too Many Requests**.
-- Buckets live in memory, so each gateway instance has its own limit. With several instances, switch to a
-  Redis-backed limiter.
-- For per-client limits, have the `KeyResolver` in `RateLimiterConfig` return `routeId + ":" + clientIp`.
+| Tier | Requests | Limit | Key |
+|---|---|---|---|
+| `auth` (strict) | `POST /api/auth/login`, `POST /api/auth/refresh`, `POST /api/users/register/**` | 10 / min | IP |
+| `sensitive` (moderate) | `POST /api/customer/checkout`, `POST /api/customer/orders/*/payments/**` | 20 / min | user, else IP |
+| `public` (generous) | `GET /api/public/**` | 300 / min | user, else IP |
+| `default` | everything else | 120 / min | user, else IP |
 
-### CORS
+Buckets refill gradually (greedy refill), so a client that hits the limit can retry after a few seconds rather
+than a full minute. Every limited response carries `X-RateLimit-Remaining`. Over the limit:
 
-The gateway applies one global CORS configuration to all paths, including preflight requests for unmatched paths:
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 6
+X-RateLimit-Remaining: 0
+{"status":429,"error":"Too Many Requests","code":"RATE_LIMITED","message":"Too many requests, retry after 6 s",...}
+```
 
-- methods: `GET, POST, PUT, PATCH, DELETE, OPTIONS`
-- headers: any; credentials allowed; max age 1 h
-- origins: `http://localhost:*` and `http://127.0.0.1:*` by default. Change them in `application.yml`
-  (`spring.cloud.gateway.server.webflux.globalcors`) or set `GATEWAY_CORS_ALLOWED_ORIGINS` to a comma-separated
-  list of origin patterns.
+Requests rejected with 401/403 are not counted. Unauthenticated callers only reach public routes, which have their
+own IP-keyed limits.
 
-If a downstream service also sends CORS headers, the gateway drops the duplicates (`DedupeResponseHeader`).
+> **Multiple gateway instances:** buckets live in each instance's memory (Bucket4j + Caffeine, up to 100,000
+> clients, idle buckets evicted). With N instances behind a load balancer, a client effectively gets up to N× the
+> limit. Run more than one instance only with a shared limiter, for example Bucket4j's Redis
+> (Lettuce/Redisson) proxy manager in `RateLimitFilter` or a Redis-backed `RequestRateLimiter`.
 
-## Prerequisites
+## CORS
 
-Start these **before** the gateway:
+CORS is answered at the gateway only (`security.cors.*`, origins from the Config Server per environment):
 
-| Dependency | Default location | Notes |
+| Setting | Value |
+|---|---|
+| allowed origins | `security.cors.allowed-origins` (env `CORS_ALLOWED_ORIGINS`). **Exact origins only**: `*` or a pattern fails startup |
+| allowed methods | `GET, POST, PUT, PATCH, DELETE, OPTIONS` |
+| allowed headers | `Authorization, Content-Type, Idempotency-Key` |
+| exposed headers | `Retry-After, X-RateLimit-Remaining` |
+| credentials | allowed, which is safe because they only go to the listed origins |
+| max age | 1 h |
+
+A preflight from an unlisted origin, or one asking for an unlisted header such as `X-User-Id`, gets 403. CORS
+headers a service might still send are de-duplicated (`DedupeResponseHeader`).
+
+## Security headers and limits
+
+- Every response: `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`.
+- `/api/auth/**` responses (tokens): `Cache-Control: no-store`, `Pragma: no-cache`.
+- These are set just before the response is sent, so they apply to service responses, fallbacks and the
+  gateway's own errors alike.
+- Request bodies are limited to `api-gateway.request.max-body-size` (**1 MB**) by `Content-Length`: larger
+  bodies get 413. Bodies without `Content-Length` (chunked) get 411, since their size can't be checked up front.
+- HSTS isn't set here: add it at the TLS-terminating proxy.
+
+## API documentation
+
+The gateway doesn't merge the services' OpenAPI documents. Each service publishes its own (internal endpoints are
+excluded):
+
+| Service | Swagger UI | OpenAPI JSON |
 |---|---|---|
-| Config Server | `http://localhost:8888` | `../config-server`. **Required**: it supplies the JWT secret (`config-repo/api-gateway.yml`), and the gateway won't start without it |
-| Eureka (service-registry) | `http://localhost:8761` | `../service-registry`. Required: routes are resolved through it |
-| At least one downstream service | registered in Eureka as `user-service` (8081), `product-service` (8082) or `order-service` (8083) | See each service's README for its own dependencies. Routes to a service that isn't running return the 503 fallback |
+| user-service | http://localhost:8081/swagger-ui.html | http://localhost:8081/v3/api-docs |
+| product-service | http://localhost:8082/swagger-ui.html | http://localhost:8082/v3/api-docs |
+| order-service | http://localhost:8083/swagger-ui.html | http://localhost:8083/v3/api-docs |
+| store-service | http://localhost:8084/swagger-ui.html | http://localhost:8084/v3/api-docs |
 
-You also need JDK 25 and Maven 3.9+.
+Use the route table above to map each documented path to the gateway (`http://localhost:8080` + the same path).
 
 ## Configuration
+
+The gateway's `application.yml` holds local defaults. The Config Server (`config-repo/api-gateway.yml` and the
+shared `application.yml`) supplies the real values, which take precedence. List properties (`public-routes`,
+`role-rules`, a tier's `routes`) are replaced as a whole by a higher-precedence source.
 
 | Env var | Default | Purpose |
 |---|---|---|
 | `CONFIG_SERVER_URL` | `http://localhost:8888` | Config Server |
 | `EUREKA_URL` | `http://localhost:8761/eureka/` | Eureka `defaultZone` |
-| `GATEWAY_CORS_ALLOWED_ORIGINS` | `http://localhost:*,http://127.0.0.1:*` | Allowed CORS origin patterns |
-| `JWT_SECRET` | local-dev fallback in `config-repo/api-gateway.yml` | HS256 secret. Must be the same value user-service gets |
+| `JWKS_URI` | `http://localhost:8081/.well-known/jwks.json` | user-service JWKS. `lb://user-service/.well-known/jwks.json` resolves through Eureka |
+| `JWT_ISSUER` | `user-service` | Expected `iss` |
+| `JWT_AUDIENCE` | `marketplace` | Required `aud` |
+| `JWT_CLOCK_SKEW_SECONDS` | `30` | `exp`/`nbf` tolerance |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:5173` | Exact CORS origins, comma-separated |
+| `GATEWAY_TRUSTED_PROXIES` | empty | IPs/CIDRs whose `X-Forwarded-For` is trusted (e.g. your load balancer) |
+| `SPRING_PROFILES_ACTIVE` | none | `local` enables the discovery debug routes and the `gateway` actuator endpoint |
+
+Other settings (in `application.yml`): `api-gateway.auth.jwks-cache-ttl` (PT5M),
+`api-gateway.auth.jwks-refresh-cooldown` (PT10S), `api-gateway.request.max-body-size` (1MB), and the rate-limit
+tiers.
+
+## Prerequisites
+
+| Dependency | Default location | Notes |
+|---|---|---|
+| Config Server | `http://localhost:8888` | `../config-server`. Optional: without it the local defaults apply |
+| Eureka (service-registry) | `http://localhost:8761` | `../service-registry`. Routes are resolved through it |
+| user-service | 8081 | Needed for the JWKS. Without it, protected routes answer 503 |
+| store/product/order-service | 8084 / 8082 / 8083 | Routes to a service that isn't running return the 503 fallback |
+
+You also need JDK 25 and Maven 3.9+.
 
 ## Run locally
 
 ```bash
-# 1. Config Server, Eureka and the services (each in its own terminal)
 (cd ../config-server && mvn spring-boot:run)
 (cd ../service-registry && mvn spring-boot:run)
-(cd ../user-service && mvn spring-boot:run)      # and/or product-service, order-service
+(cd ../user-service && mvn spring-boot:run)     # then store-service, product-service, order-service
 
-# 2. The gateway
-mvn spring-boot:run
+SPRING_PROFILES_ACTIVE=local mvn spring-boot:run
 ```
 
-Wait until the services show up in the Eureka dashboard (http://localhost:8761). Registration and the
-gateway's Eureka cache can take up to ~30 s after a service starts. Until then, its routes return the 503
+Services can take up to ~30 s to appear in the gateway's Eureka cache. Until then their routes return the 503
 fallback.
 
 ### Docker
@@ -185,110 +315,39 @@ docker build -t api-gateway .
 docker run -p 8080:8080 \
   -e CONFIG_SERVER_URL=http://host.docker.internal:8888 \
   -e EUREKA_URL=http://host.docker.internal:8761/eureka/ \
-  -e JWT_SECRET="$JWT_SECRET" \
+  -e JWKS_URI=lb://user-service/.well-known/jwks.json \
+  -e GATEWAY_TRUSTED_PROXIES=10.0.0.0/8 \
   api-gateway
 ```
 
-The image is multi-stage and runs as a non-root `spring` user. Services register in Eureka by IP, so the
-container must be able to reach those IPs.
-
-## Verify the routing
+## Example requests
 
 ```bash
-# All routes (the 3 explicit ones + one per service registered in Eureka), with their predicates and URIs
-curl -s localhost:8080/actuator/gateway/routes | jq '.[] | {route_id, predicate, uri}'
-
-# Health, and each route's circuit breaker state
-curl -s localhost:8080/actuator/health | jq
-curl -s localhost:8080/actuator/circuitbreakers | jq
-```
-
-The gateway actuator endpoint is **read-only**: routes can be inspected but not added or refreshed over HTTP.
-
-## Example requests through the gateway
-
-These are the same calls as in each service's README, but sent to port 8080. Register and log in first, since
-every other call needs the token.
-
-```bash
-# --- user-service (/api/users/**, /api/auth/**) ---
-# Public: no token needed
-curl -i -X POST localhost:8080/api/users/register -H 'Content-Type: application/json' \
-  -d '{"email":"jane@example.com","password":"Str0ng!Passw0rd","firstName":"Jane","lastName":"Doe"}'
-
+# Public: register and log in (no token)
+curl -s -X POST localhost:8080/api/users/register/customer -H 'Content-Type: application/json' -d @customer.json
 TOKEN=$(curl -s -X POST localhost:8080/api/auth/login -H 'Content-Type: application/json' \
-  -d '{"email":"jane@example.com","password":"Str0ng!Passw0rd"}' | jq -r .accessToken)
+  -d '{"email":"jane@example.com","password":"a-long-Passw0rd!"}' | jq -r .accessToken)
 AUTH="Authorization: Bearer $TOKEN"
 
 curl -s localhost:8080/api/users/me -H "$AUTH" | jq
+curl -s 'localhost:8080/api/public/products?q=laptop' | jq           # public browsing
+curl -s localhost:8080/api/customer/cart -H "$AUTH" | jq
 
-# --- Rejected requests ---
-# No token -> 401
-curl -i localhost:8080/api/users/me
-# HTTP/1.1 401 Unauthorized
-# WWW-Authenticate: Bearer
-# {"error":"Authentication required"}
+# Rejections
+curl -i localhost:8080/api/customer/orders                           # 401 UNAUTHORIZED
+curl -i localhost:8080/api/admin/orders -H "$AUTH"                   # 403 ACCESS_DENIED (customer token)
+curl -i localhost:8080/internal/users/x/security-state               # 404 NOT_FOUND
+for i in $(seq 1 11); do curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8080/api/auth/login; done
+                                                                      # ... 429 with Retry-After on the 11th
 
-# Wrong scheme -> 401, same body
-curl -i localhost:8080/api/orders -H 'Authorization: Basic dXNlcjpwYXNz'
+# CORS preflight
+curl -si -X OPTIONS localhost:8080/api/customer/checkout -H 'Origin: http://localhost:5173' \
+  -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: Idempotency-Key' | grep -i '^access-control'
 
-# Tampered, expired or otherwise invalid token -> 401
-curl -i localhost:8080/api/users/me -H "Authorization: Bearer ${TOKEN%?}x"
-# HTTP/1.1 401 Unauthorized
-# {"error":"Invalid or expired token"}
-
-# --- product-service (/api/products/**, /api/categories/**) ---
-CATEGORY_ID=$(curl -s -X POST localhost:8080/api/categories -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"name": "Electronics"}' | jq -r .id)
-PRODUCT_ID=$(curl -s -X POST localhost:8080/api/products -H "$AUTH" -H 'Content-Type: application/json' \
-  -d "{\"name\": \"Gaming Laptop\", \"price\": 999.99, \"sku\": \"LAP-001\", \"categoryId\": \"$CATEGORY_ID\"}" | jq -r .id)
-curl -s -X PATCH localhost:8080/api/products/$PRODUCT_ID/inventory -H "$AUTH" -H 'Content-Type: application/json' \
-  -d '{"delta": 10}' | jq
-curl -s localhost:8080/api/categories -H "$AUTH" | jq
-
-# --- order-service (/api/orders/**) ---
-USER_ID=$(uuidgen)
-ORDER_ID=$(curl -s -X POST localhost:8080/api/orders -H "$AUTH" -H 'Content-Type: application/json' \
-  -d "{\"userId\": \"$USER_ID\", \"items\": [{\"productId\": \"$PRODUCT_ID\", \"quantity\": 2}]}" | jq -r .id)
-curl -s localhost:8080/api/orders/$ORDER_ID -H "$AUTH" | jq
-
-# --- discovery-locator fallback route (debugging only) ---
-curl -s localhost:8080/PRODUCT-SERVICE/api/categories -H "$AUTH" | jq
-
-# --- CORS preflight from a local frontend ---
-curl -si -X OPTIONS localhost:8080/api/products \
-  -H 'Origin: http://localhost:5173' -H 'Access-Control-Request-Method: POST' | grep -i '^access-control'
+# Health and breakers (local profile also: /actuator/gateway/routes)
+curl -s localhost:8080/actuator/health | jq
+curl -s localhost:8080/actuator/circuitbreakers | jq
 ```
-
-To see the rate limiter, fire a burst at one route. Some requests should come back as 429:
-
-```bash
-seq 1 300 | xargs -P 50 -I{} curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/api/categories -H "$AUTH" | sort | uniq -c
-```
-
-## Observing a route's circuit breaker
-
-1. With the gateway and order-service running, check the breaker:
-   `curl -s localhost:8080/actuator/circuitbreakers | jq .circuitBreakers.orderService` → `"state": "CLOSED"`.
-2. **Stop order-service** (Ctrl+C its `mvn spring-boot:run`).
-3. Call its route. Expect a **503** straight away, not a hang:
-   ```bash
-   curl -i localhost:8080/api/orders/$ORDER_ID -H "$AUTH"
-   # HTTP/1.1 503 Service Unavailable
-   # {"error":"order-service is temporarily unavailable"}
-   ```
-   While Eureka still lists the stopped instance, the connection is refused. Once Eureka drops it (up to ~90 s),
-   the load balancer finds no instance. Either way the response is the 503 fallback, and the gateway logs the
-   cause (`Fallback for order-service: ...`).
-4. Repeat 5 times. At ≥ 50 % failures the breaker **opens** (`/actuator/circuitbreakers` shows `OPEN`). Requests
-   now go straight to the fallback without calling order-service. `/actuator/circuitbreakerevents` lists each
-   call and state change.
-5. The other routes keep working, because each route has its own breaker.
-6. Start order-service again. After 15 s the breaker goes half-open, lets 3 trial calls through, and closes if
-   they succeed.
-
-To see the **3 s timeout**, keep the service running but make it slow (e.g. pause it in a debugger). The gateway
-returns the 503 fallback after about 3 s.
 
 ## Tests
 
@@ -296,38 +355,48 @@ returns the 503 fallback after about 3 s.
 mvn clean package
 ```
 
-`JwtAuthenticationFilterTest` tests the filter on its own. It uses the real decoder from `JwtConfig`, with tokens
-signed the way user-service signs them:
+No Config Server, Eureka or service is needed. The JWKS comes from an in-test HTTP server (`JwksTestServer`), and
+tokens are signed the way user-service signs them (`TestTokens`).
 
-- a valid token passes through with `X-User-Id` = `sub` and `X-User-Roles` = the comma-joined `roles` claim
-- `X-User-Id` / `X-User-Roles` sent by the client are replaced on protected routes and removed on public ones
-- missing or malformed `Authorization` header → 401 `Authentication required`
-- expired, wrongly signed, wrong-issuer or unparseable token → 401 `Invalid or expired token`
-- `POST /api/auth/login` and `POST /api/users/register` pass with no token; `GET /api/auth/login` doesn't
+- **`JwtAuthenticationFilterTest`** (the real decoder):
+  - A valid RS256 token passes, with `Authorization` forwarded unchanged and no identity headers added.
+  - These are all rejected with the same 401: wrong signature, unknown `kid`, `alg=none`, HS256 (including signed
+    with the public key), wrong issuer, wrong or missing audience, expired beyond 30 s, not yet valid, no `exp`,
+    no `role`, missing or malformed header.
+  - A token that expired within the 30 s skew is accepted.
+  - Spoofed `X-User-Id`/`X-User-Roles` are stripped on protected and public routes.
+  - Public routes pass without a token, but only for their method.
+  - The role-prefix matrix gives 403 with the standard body.
+  - An unreachable JWKS gives 503.
+- **`JwksCacheTest`**: keys are cached, re-fetched after the TTL, and re-fetched on an unknown `kid` at most once
+  per cooldown. Stale keys are kept when a refresh fails, and a missing key set is reported as unavailable.
+- **`RateLimitFilterTest`**:
+  - Each client gets its own bucket, keyed by user when authenticated and by IP otherwise.
+  - Login is stricter than the default tier and is always IP-keyed.
+  - The limit gives 429 with `Retry-After` and the standard body.
+  - `X-Forwarded-For` is honoured only from trusted proxies.
+  - Checkout and payment share the moderate tier.
+- **`RequestGuardFilterTest`**:
+  - `/internal/**` variants (case, `//`, `;matrix`, percent-encoding) and `/fallback/**` give 404.
+  - `..`, `%2e%2e` and encoded slashes give 400.
+  - A body over the limit gives 413, and a chunked body gives 411.
+- **`RouteConfigurationTest`** (the whole gateway):
+  - There are four `lb://` routes, each with its own breaker and fallback.
+  - 64 sample paths each match **exactly one** route, and other paths (including `/internal/**`) match none.
+  - Requests to unavailable services return the 503 fallback.
+  - Public routes are routed without a token. Protected ones give 401, and wrong roles give 403.
+  - `/internal/**` and `/fallback/**` give 404, and path traversal gives 400.
+  - Login gives 429 after 10 requests, for that client only.
+  - Auth responses carry the security headers and `no-store`.
+  - CORS allows the listed origin and rejects others and unlisted headers.
+  - The discovery locator and the `gateway` actuator endpoint are off.
+- **`LocalProfileTest`**: in the `local` profile, the discovery routes exist, need a token, and can't reach
+  `/internal/**`.
 
-`RouteConfigurationTest` runs without Config Server, Eureka or any downstream service. The JWT secret is set as a
-test property. It checks the configuration without making real requests to the services:
+## Known limitations
 
-- exactly three explicit routes, each with the expected `lb://` URI and `Path` patterns
-- each route has a `CircuitBreaker` filter with the right breaker name and `forward:/fallback/<service>`
-- sample paths (`/api/auth/login`, `/api/users/me/addresses`, `/api/categories`, ...) match exactly one expected
-  route, and unknown `/api/...` paths match none
-- `RequestRateLimiter` (100/s) is a default filter and the discovery locator is enabled
-- no service is registered in the test, so a real request to each route checks the circuit breaker wiring: the
-  response is the JSON 503 fallback with an `X-RateLimit-Remaining` header
-- through the running gateway, a protected route without a token gets 401, and the public login route is routed
-  without one
-
-End-to-end tests against the real services aren't practical here, because all three would have to be running.
-
-## Known limitations / next steps
-
-- **The services are still reachable directly** (e.g. `localhost:8083`), bypassing the gateway. Before they rely
-  on `X-User-Id` / `X-User-Roles`, only the gateway should be able to reach them (network isolation, or a check
-  that the request came from the gateway).
-- The gateway checks only that the caller is authenticated, not their roles. Role-based rules (e.g. admin-only
-  product writes) are left to the services, which get `X-User-Roles`.
-- The `/<SERVICE-ID>/**` debug routes need a token like everything else, including their login/register paths.
-- Rate limits are per gateway instance and per route, not per client (see *Rate limiting*).
-- The discovery locator exposes every registered service under `/<SERVICE-ID>/**`, without a circuit breaker.
-  That is useful for debugging, but it could be disabled or restricted with `include-expression` in production.
+- Rate-limit buckets are per instance (see the note under *Rate limiting*).
+- The gateway doesn't check token revocation (`tv`): services do, so a revoked token is refused by the service, not
+  the gateway.
+- Services are still reachable directly on their own ports. That is acceptable now because each one validates the
+  JWT itself and no longer trusts identity headers, but in production only the gateway should be exposed.

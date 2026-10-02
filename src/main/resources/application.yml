@@ -13,7 +13,7 @@ spring:
       bulkhead:
         resilience4j:
           # Otherwise each breaker is silently wrapped in a 25-concurrent-call bulkhead, and bursts get 503
-          # fallbacks long before the rate limiter applies. Concurrency is limited by RequestRateLimiter instead.
+          # fallbacks long before the rate limiter applies.
           enabled: false
     gateway:
       # Gateway 5.x moved all properties from spring.cloud.gateway.* to spring.cloud.gateway.server.webflux.*
@@ -23,21 +23,77 @@ spring:
             connect-timeout: 1000
             # Backstop only: the 3s TimeLimiter below normally fires first
             response-timeout: 4s
-          # Primary routes: clean /api/... URLs, resolved through Eureka (lb://) rather than fixed hosts
+          # One route per service, resolved through Eureka (lb://). Paths are forwarded unchanged.
+          # The Path patterns of different routes never overlap (RouteConfigurationTest checks sample paths against
+          # every route), so each request matches exactly one route; "order" only makes the evaluation order fixed.
+          # /internal/** is never routed, and RequestGuardFilter / DownstreamPathGuardFilter answer it with 404.
           routes:
             - id: user-service
               uri: lb://user-service
+              order: 10
               predicates:
-                - Path=/api/users/**,/api/auth/**
+                - name: Path
+                  args:
+                    patterns:
+                      - /api/auth/**
+                      - /api/users/**
+                      - /api/merchant/application/**
+                      - /api/merchant/owner/assistants/**
+                      - /api/admin/users/**
+                      - /api/admin/merchants/pending
+                      - "/api/admin/merchants/*/{action:approve|reject|ban|unban}"
+                      # Only ban/unban: /api/admin/customers/*/score belongs to order-service
+                      - "/api/admin/customers/*/{action:ban|unban}"
+                      - /api/super-admin/admins/**
+                      - /.well-known/jwks.json
               filters:
                 - name: CircuitBreaker
                   args:
                     name: userService
                     fallbackUri: forward:/fallback/user-service
+            - id: store-service
+              uri: lb://store-service
+              order: 20
+              predicates:
+                - name: Path
+                  args:
+                    patterns:
+                      - /api/public/stores/**
+                      - /api/merchant/store/**
+                      - /api/merchant/owner/bank-accounts/**
+                      - /api/merchant/owner/couriers/**
+                      - /api/merchant/owner/shipping-templates/**
+                      - /api/merchant/owner/metrics/**
+                      - /api/merchant/reviews/**
+                      - /api/customer/stores/**
+                      - /api/admin/stores/**
+                      - /api/admin/merchants/at-risk
+                      - /api/admin/banks/**
+                      - /api/admin/couriers/**
+                      - /api/super-admin/settings/**
+                      - /api/super-admin/holidays/**
+                      - /api/super-admin/merchants/**
+              filters:
+                - name: CircuitBreaker
+                  args:
+                    name: storeService
+                    fallbackUri: forward:/fallback/store-service
             - id: product-service
               uri: lb://product-service
+              order: 30
               predicates:
-                - Path=/api/products/**,/api/categories/**
+                - name: Path
+                  args:
+                    patterns:
+                      - /api/public/products/**
+                      - /api/public/categories/**
+                      - /api/merchant/products/**
+                      - /api/merchant/variants/**
+                      - /api/merchant/discounts/**
+                      - /api/customer/products/**
+                      - /api/admin/products/**
+                      - /api/admin/categories/**
+                      - /api/admin/reviews/**
               filters:
                 - name: CircuitBreaker
                   args:
@@ -45,40 +101,34 @@ spring:
                     fallbackUri: forward:/fallback/product-service
             - id: order-service
               uri: lb://order-service
+              order: 40
               predicates:
-                - Path=/api/orders/**
+                - name: Path
+                  args:
+                    patterns:
+                      - /api/customer/cart/**
+                      - /api/customer/checkout
+                      - /api/customer/orders/**
+                      - /api/customer/complaints/**
+                      - /api/merchant/orders/**
+                      - /api/merchant/customer-blocks/**
+                      - /api/admin/orders/**
+                      - /api/admin/complaints/**
+                      - /api/admin/flagged-references/**
+                      - /api/admin/customers/*/score
               filters:
                 - name: CircuitBreaker
                   args:
                     name: orderService
                     fallbackUri: forward:/fallback/order-service
-          # Applied to every route, including the discovery-locator ones
+          # Applied to every route
           default-filters:
-            # Built-in RequestRateLimiter backed by Gateway's Bucket4jRateLimiter with in-memory buckets
-            # (see RateLimiterConfig). 100 requests/second per route; over the limit -> 429.
-            - name: RequestRateLimiter
-              args:
-                bucket4j-rate-limiter.capacity: 100
-                bucket4j-rate-limiter.refillPeriod: 1s
-            # Downstream services may add their own CORS headers; keep the gateway's single copy
+            # CORS is answered by the gateway only; drop copies a service might still send
             - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_FIRST
-          # Fallback for debugging: /USER-SERVICE/**, /PRODUCT-SERVICE/**, ... for every service registered in
-          # Eureka (prefix stripped before forwarding). Clients should use the explicit /api/... routes above.
+          # /<SERVICE-ID>/** debug routes for every service in Eureka: local profile only (application-local.yml)
           discovery:
             locator:
-              enabled: true
-          globalcors:
-            # Also answer preflight requests for paths no route matches
-            add-to-simple-url-handler-mapping: true
-            cors-configurations:
-              '[/**]':
-                # Comma-separated patterns; override with GATEWAY_CORS_ALLOWED_ORIGINS
-                allowed-origin-patterns: ${GATEWAY_CORS_ALLOWED_ORIGINS:http://localhost:*,http://127.0.0.1:*}
-                allowed-methods: GET,POST,PUT,PATCH,DELETE,OPTIONS
-                allowed-headers: "*"
-                exposed-headers: X-RateLimit-Remaining
-                allow-credentials: true
-                max-age: 3600
+              enabled: false
 
 eureka:
   client:
@@ -105,6 +155,8 @@ resilience4j:
     instances:
       userService:
         base-config: default
+      storeService:
+        base-config: default
       productService:
         base-config: default
       orderService:
@@ -118,6 +170,8 @@ resilience4j:
     instances:
       userService:
         base-config: default
+      storeService:
+        base-config: default
       productService:
         base-config: default
       orderService:
@@ -127,25 +181,107 @@ management:
   endpoints:
     web:
       exposure:
-        # gateway -> /actuator/gateway/routes; circuitbreakers / circuitbreakerevents show each route's breaker
-        include: health,info,gateway,circuitbreakers,circuitbreakerevents
+        # The "gateway" endpoint is added in the local profile only (application-local.yml)
+        include: health,info,circuitbreakers,circuitbreakerevents
   endpoint:
     gateway:
       # Allow inspecting routes but not adding/removing them at runtime over HTTP
       access: read-only
 
+# Local defaults. The Config Server (config-repo/api-gateway.yml) supplies the real values per environment and
+# takes precedence over this file.
 api-gateway:
   auth:
-    # Name of the property that holds the HS256 signing secret: the same key user-service reads. The Config Server
-    # supplies it (config-server/config-repo/api-gateway.yml); there is no local default, so without it the
-    # gateway refuses to start.
-    secret-property: security.jwt.secret
-    # Must match user-service's security.jwt.issuer
-    issuer: user-service
-    # Requests allowed without a token. method: omit for any method; path: Spring path pattern (/**, {id}, ...).
+    # user-service's JWKS. lb://user-service/.well-known/jwks.json also works (resolved through Eureka).
+    jwks-uri: ${JWKS_URI:http://localhost:8081/.well-known/jwks.json}
+    issuer: ${JWT_ISSUER:user-service}
+    audience: ${JWT_AUDIENCE:marketplace}
+    clock-skew-seconds: ${JWT_CLOCK_SKEW_SECONDS:30}
+    # Keys are re-fetched after this TTL, and on an unknown kid at most once per cooldown
+    jwks-cache-ttl: PT5M
+    jwks-refresh-cooldown: PT10S
+    # Requests allowed without a token. method: HTTP method; path: Spring path pattern.
     # Everything else needs "Authorization: Bearer <token>".
     public-routes:
       - method: POST
         path: /api/auth/login
       - method: POST
-        path: /api/users/register
+        path: /api/auth/refresh
+      - method: POST
+        path: /api/users/register/customer
+      - method: POST
+        path: /api/users/register/merchant
+      - method: GET
+        path: /.well-known/jwks.json
+      - method: GET
+        path: /api/public/**
+    # Coarse role check on authenticated requests (defence in depth; services enforce the real rules).
+    # The first matching path decides; paths matching no rule only need a valid token. Wrong role -> 403.
+    role-rules:
+      - path: /api/customer/**
+        roles: ROLE_CUSTOMER
+      # Owner-only (docs/marketplace-design.md 3.4): assistants never reach these
+      - path: /api/merchant/owner/**
+        roles: ROLE_MERCHANT
+      - path: /api/merchant/**
+        roles: ROLE_MERCHANT,ROLE_ASSISTANT
+      - path: /api/admin/**
+        roles: ROLE_ADMIN,ROLE_SUPER_ADMIN
+      - path: /api/super-admin/**
+        roles: ROLE_SUPER_ADMIN
+
+  # Per-client limits (key = authenticated user id, else client IP), not per route. The first tier whose routes
+  # match wins; other requests use "default". Over the limit -> 429 with Retry-After.
+  # Buckets are in memory per gateway instance; several instances need a shared (Redis) limiter.
+  rate-limit:
+    # Proxies whose X-Forwarded-For is trusted (comma-separated IPs/CIDRs). Empty: use the TCP peer address.
+    trusted-proxies: ${GATEWAY_TRUSTED_PROXIES:}
+    tiers:
+      # Strict, keyed by IP: credential stuffing and sign-up abuse
+      auth:
+        capacity: 10
+        refill-period: PT1M
+        key: ip
+        routes:
+          - method: POST
+            path: /api/auth/login
+          - method: POST
+            path: /api/auth/refresh
+          - method: POST
+            path: /api/users/register/**
+      # Moderate: checkout and payment submission
+      sensitive:
+        capacity: 20
+        refill-period: PT1M
+        key: user-or-ip
+        routes:
+          - method: POST
+            path: /api/customer/checkout
+          - method: POST
+            path: /api/customer/orders/*/payments/**
+      # Generous: anonymous browsing and search
+      public:
+        capacity: 300
+        refill-period: PT1M
+        key: user-or-ip
+        routes:
+          - method: GET
+            path: /api/public/**
+      default:
+        capacity: 120
+        refill-period: PT1M
+        key: user-or-ip
+
+  request:
+    # Larger bodies get 413; bodies without Content-Length (chunked) get 411
+    max-body-size: 1MB
+
+security:
+  cors:
+    # Exact origins only (no wildcards); the Config Server sets them per environment (CORS_ALLOWED_ORIGINS)
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173}
+    allowed-methods: GET,POST,PUT,PATCH,DELETE,OPTIONS
+    allowed-headers: Authorization,Content-Type,Idempotency-Key
+    exposed-headers: Retry-After,X-RateLimit-Remaining
+    allow-credentials: true
+    max-age: PT1H

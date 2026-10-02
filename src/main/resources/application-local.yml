@@ -1,0 +1,18 @@
+# Developer machines only (SPRING_PROFILES_ACTIVE=local).
+spring:
+  cloud:
+    gateway:
+      server:
+        webflux:
+          # Debug routes /<SERVICE-ID>/** for every service registered in Eureka (prefix stripped before forwarding).
+          # They need a token like everything else, have no circuit breaker, and still can't reach /internal/**
+          # (DownstreamPathGuardFilter). Never enable them outside "local".
+          discovery:
+            locator:
+              enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,circuitbreakers,circuitbreakerevents,gateway

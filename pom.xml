@@ -20,7 +20,7 @@
     <properties>
         <java.version>25</java.version>
         <spring-cloud.version>2025.1.3</spring-cloud.version>
-        <!-- Same version spring-cloud-gateway-server-webflux 5.0.3 compiles against (it declares Bucket4j as optional) -->
+        <!-- Same Bucket4j version spring-cloud-gateway-server-webflux 5.0.3 compiles against -->
         <bucket4j.version>8.15.0</bucket4j.version>
     </properties>
 
@@ -48,22 +48,27 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
         <dependency>
-            <!-- JWT verification with the same Nimbus JOSE support user-service signs with (via its resource-server
-                 starter). Only the JOSE module: spring-security-config/web would switch on Spring Security's own
-                 WebFlux filter chain, and the gateway does its own auth in JwtAuthenticationFilter. -->
+            <!-- RS256 JWT verification against user-service's JWKS (Nimbus JOSE, as in every service). Only the JOSE
+                 module: spring-security-config/web would switch on Spring Security's own WebFlux filter chain, and the
+                 gateway does its own auth in JwtAuthenticationFilter. -->
             <groupId>org.springframework.security</groupId>
             <artifactId>spring-security-oauth2-jose</artifactId>
         </dependency>
         <dependency>
-            <!-- In-memory (Caffeine-backed) buckets for Gateway's built-in Bucket4jRateLimiter; no Redis needed -->
+            <!-- Token buckets for the per-client RateLimitFilter (in memory, per gateway instance) -->
             <groupId>com.bucket4j</groupId>
-            <artifactId>bucket4j_jdk17-caffeine</artifactId>
+            <artifactId>bucket4j_jdk17-core</artifactId>
             <version>${bucket4j.version}</version>
         </dependency>
         <dependency>
-            <!-- bucket4j-caffeine declares Caffeine as "provided"; version managed by Spring Boot -->
+            <!-- Holds one bucket per client and tier, evicted when idle; version managed by Spring Boot -->
             <groupId>com.github.ben-manes.caffeine</groupId>
             <artifactId>caffeine</artifactId>
+        </dependency>
+        <dependency>
+            <!-- Bean Validation for the @Validated configuration properties -->
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
         <dependency>
